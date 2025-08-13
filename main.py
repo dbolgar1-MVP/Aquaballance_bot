@@ -1,142 +1,285 @@
-# main.py — минимальный FastAPI webhook + простая sqlite/postgres интеграция
-import os, math, io, datetime
+import os
+import asyncio
+from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
-import requests
-from sqlalchemy import create_engine, text
-import matplotlib.pyplot as plt
+from aiogram import Bot, Dispatcher
+from aiogram.filters import Command
+from aiogram.types import Message
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncEngine
+from dotenv import load_dotenv
+import datetime
+
+load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-if not TELEGRAM_TOKEN:
-    raise RuntimeError("Set TELEGRAM_TOKEN env var")
-BOT_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+DATABASE_URL   = os.getenv("DATABASE_URL")   # пример: postgresql://user:pass@host:5432/db
+KEEPALIVE_TOKEN = os.getenv("KEEPALIVE_TOKEN", "pingme")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./dev.db")
-# For sqlite use check_same_thread; for postgres it's ignored
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {})
+if not TELEGRAM_TOKEN or not DATABASE_URL:
+    raise RuntimeError("Set TELEGRAM_TOKEN and DATABASE_URL")
 
+# --- SQLAlchemy async engine (конвертируем схему в asyncpg при необходимости)
+if DATABASE_URL.startswith("postgresql://"):
+    ASYNC_DB_URL = DATABASE_URL.replace("postgresql://", "postgresql+asyncpg://", 1)
+else:
+    ASYNC_DB_URL = DATABASE_URL
+
+engine: AsyncEngine = create_async_engine(ASYNC_DB_URL, pool_pre_ping=True)
+
+# --- Telegram
+bot = Bot(token=TELEGRAM_TOKEN)
+dp  = Dispatcher()
+
+# --- FastAPI для health и «привязки порта» на Render
 app = FastAPI()
 
-# Create minimal tables if not exist
 DDL = """
+CREATE TABLE IF NOT EXISTS users (
+  id SERIAL PRIMARY KEY,
+  chat_id BIGINT UNIQUE NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS aquariums (
   id SERIAL PRIMARY KEY,
-  chat_id BIGINT,
-  name TEXT,
-  volume_l INTEGER,
-  created_at TIMESTAMP DEFAULT now()
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  description TEXT,
+  volume_l INTEGER CHECK (volume_l > 0),
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS user_settings (
+  user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  default_aquarium_id INTEGER REFERENCES aquariums(id) ON DELETE SET NULL
+);
+CREATE TABLE IF NOT EXISTS fish_species (
+  id SERIAL PRIMARY KEY,
+  common_name TEXT NOT NULL,
+  latin_name TEXT,
+  ph_min NUMERIC, ph_max NUMERIC,
+  gh_min NUMERIC, gh_max NUMERIC,
+  kh_min NUMERIC, kh_max NUMERIC,
+  temp_min_c NUMERIC, temp_max_c NUMERIC,
+  notes TEXT
+);
+CREATE TABLE IF NOT EXISTS plant_species (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  ph_min NUMERIC, ph_max NUMERIC,
+  temp_min_c NUMERIC, temp_max_c NUMERIC,
+  notes TEXT
+);
+CREATE TABLE IF NOT EXISTS aquarium_fish (
+  id SERIAL PRIMARY KEY,
+  aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
+  species_id INTEGER NOT NULL REFERENCES fish_species(id),
+  qty INTEGER NOT NULL CHECK (qty >= 0)
+);
+CREATE TABLE IF NOT EXISTS aquarium_plants (
+  id SERIAL PRIMARY KEY,
+  aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
+  species_id INTEGER NOT NULL REFERENCES plant_species(id),
+  qty INTEGER NOT NULL CHECK (qty >= 0)
 );
 CREATE TABLE IF NOT EXISTS water_tests (
   id SERIAL PRIMARY KEY,
-  aquarium_id INTEGER,
-  measured_at TIMESTAMP,
+  aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
+  measured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   ph NUMERIC, kh NUMERIC, gh NUMERIC,
-  no2 NUMERIC, no3 NUMERIC, nh3_total NUMERIC,
-  po4 NUMERIC, temp_c NUMERIC,
-  fraction_nh3 NUMERIC, unionized_nh3_mgL NUMERIC,
-  created_at TIMESTAMP DEFAULT now()
+  no2 NUMERIC, no3 NUMERIC,
+  tan NUMERIC, po4 NUMERIC,
+  temp_c NUMERIC,
+  frac_nh3 NUMERIC,
+  nh3_mgL NUMERIC
 );
+CREATE INDEX IF NOT EXISTS idx_water_tests_aq_time ON water_tests(aquarium_id, measured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_aquariums_user ON aquariums(user_id);
 """
-with engine.begin() as conn:
-    # Render/Postgres accepts SERIAL; sqlite will just create columns (works for MVP)
-    for stmt in DDL.split(";"):
-        if stmt.strip():
-            conn.execute(text(stmt))
 
-def send_message(chat_id:int, text:str):
-    requests.post(f"{BOT_API}/sendMessage", json={"chat_id": chat_id, "text": text})
+PG_FUNC = """
+CREATE OR REPLACE FUNCTION calc_nh3_components(p_ph NUMERIC, p_temp_c NUMERIC, p_tan NUMERIC)
+RETURNS TABLE(frac_nh3 NUMERIC, nh3_mgL NUMERIC, nh4_mgL NUMERIC)
+LANGUAGE plpgsql AS $$
+DECLARE pKa NUMERIC;
+BEGIN
+  IF p_ph IS NULL OR p_temp_c IS NULL OR p_tan IS NULL THEN
+     RETURN QUERY SELECT NULL::NUMERIC, NULL::NUMERIC, NULL::NUMERIC;
+     RETURN;
+  END IF;
+  pKa := 0.09018 + 2729.92 / (273.2 + p_temp_c);
+  frac_nh3 := 1.0 / (1.0 + POWER(10, (pKa - p_ph)));
+  nh3_mgL := p_tan * frac_nh3;
+  nh4_mgL := p_tan - nh3_mgL;
+  RETURN;
+END $$;
+"""
 
-def send_photo(chat_id:int, png_bytes:bytes, caption:str=""):
-    files = {"photo": ("chart.png", png_bytes, "image/png")}
-    data = {"chat_id": chat_id, "caption": caption}
-    requests.post(f"{BOT_API}/sendPhoto", data=data, files=files)
-
-def fraction_unioned_ammonia(pH:float, temp_c:float) -> float:
-    # pKa approximation (temperature dependent)
+def unionized_fraction(ph: float, temp_c: float) -> float:
+    """Доля NH3 (unionized)."""
     pKa = 0.09018 + 2729.92 / (273.2 + temp_c)
-    frac = 1.0 / (1.0 + 10**(pKa - pH))
-    return frac
+    return 1.0 / (1.0 + 10 ** (pKa - ph))
 
-@app.post("/webhook/{token}")
-async def telegram_webhook(token: str, req: Request):
-    if token != TELEGRAM_TOKEN:
-        raise HTTPException(status_code=403, detail="bad token")
-    update = await req.json()
-    message = update.get("message") or update.get("edited_message") or {}
-    if not message:
-        return {"ok": True}
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    text = message.get("text", "").strip()
-    # /start
-    if text.startswith("/start"):
-        send_message(chat_id, "Привет! Я АкваХранитель (MVP).\nКоманды: /add_aq name volume_l, /add_test aq_id ph kh gh no2 no3 nh3_total po4 temp_c, /chart aq_id param")
-        return {"ok": True}
-    # /add_aq <name> <volume>
-    if text.startswith("/add_aq"):
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3:
-            send_message(chat_id, "Использование: /add_aq <name> <volume_l>")
-            return {"ok": True}
-        name = parts[1]
-        try:
-            volume = int(parts[2])
-        except:
-            send_message(chat_id, "Volume должен быть числом (литры).")
-            return {"ok": True}
-        with engine.begin() as conn:
-            conn.execute(text("INSERT INTO aquariums(chat_id,name,volume_l) VALUES(:c,:n,:v)"),
-                         {"c": chat_id, "n": name, "v": volume})
-        send_message(chat_id, f"Аквариум '{name}' {volume}л добавлен.")
-        return {"ok": True}
-    # /add_test <aq_id> ph kh gh no2 no3 nh3_total po4 temp_c
-    if text.startswith("/add_test"):
-        parts = text.split()
-        if len(parts) < 9:
-            send_message(chat_id, "Использование: /add_test <aq_id> ph kh gh no2 no3 nh3_total po4 temp_c")
-            return {"ok": True}
-        try:
-            aq_id = int(parts[1]); ph=float(parts[2]); kh=float(parts[3]); gh=float(parts[4])
-            no2=float(parts[5]); no3=float(parts[6]); nh3_total=float(parts[7]); po4=float(parts[8]); temp_c=float(parts[9])
-        except Exception as e:
-            send_message(chat_id, "Ошибка парсинга: " + str(e))
-            return {"ok": True}
-        frac = fraction_unioned_ammonia(ph, temp_c)
-        unionized = nh3_total * frac
-        with engine.begin() as conn:
-            conn.execute(text("""
-                INSERT INTO water_tests(aquarium_id,measured_at,ph,kh,gh,no2,no3,nh3_total,po4,temp_c,fraction_nh3,unionized_nh3_mgL)
-                VALUES(:aq,:m,:ph,:kh,:gh,:no2,:no3,:nh3,:po4,:temp,:frac,:un)
-            """), {"aq":aq_id,"m":datetime.datetime.utcnow(),"ph":ph,"kh":kh,"gh":gh,"no2":no2,"no3":no3,"nh3":nh3_total,"po4":po4,"temp":temp_c,"frac":frac,"un":unionized})
-        reply = f"Тест сохранён. unionized NH3 fraction={frac:.4f}, unionized NH3={unionized:.4f} mg/L"
-        if unionized > 0.05:
-            reply += "\n⚠️ Внимание: unionized NH3 > 0.05 mg/L — возможна токсичность."
-        send_message(chat_id, reply)
-        return {"ok": True}
-    # /chart <aq_id> <param>
-    if text.startswith("/chart"):
-        parts = text.split()
-        if len(parts)<3:
-            send_message(chat_id, "Использование: /chart <aq_id> <param>")
-            return {"ok": True}
-        aq_id = int(parts[1]); param = parts[2]
-        with engine.connect() as conn:
-            rows = conn.execute(text("SELECT measured_at,ph,kh,gh,no2,no3,nh3_total,po4,temp_c,unionized_nh3_mgL FROM water_tests WHERE aquarium_id=:aq ORDER BY measured_at"),
-                                {"aq":aq_id}).fetchall()
-        if not rows:
-            send_message(chat_id, "Нет тестов для этого аквариума.")
-            return {"ok": True}
-        # map param to column index
-        cols = {"ph":1,"kh":2,"gh":3,"no2":4,"no3":5,"nh3_total":6,"po4":7,"temp_c":8,"unionized_nh3":9}
-        if param not in cols:
-            send_message(chat_id, "Параметр неизвестен.")
-            return {"ok": True}
-        xs = [r[0] for r in rows]
-        ys = [float(r[cols[param]]) for r in rows]
-        plt.figure(figsize=(8,4)); plt.plot(xs,ys,marker='o'); plt.title(f"AQ {aq_id} — {param}"); plt.grid(True)
-        buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight'); buf.seek(0); plt.close()
-        send_photo(chat_id, buf.getvalue(), caption=f"Динамика {param}")
-        return {"ok": True}
-    # unknown
-    send_message(chat_id, "Команда не распознана. /start для помощи.")
+async def ensure_schema():
+    async with engine.begin() as conn:
+        for stmt in DDL.split(";"):
+            if stmt.strip():
+                await conn.execute(text(stmt))
+        await conn.execute(text(PG_FUNC))
+
+async def get_or_create_user(chat_id: int) -> int:
+    async with engine.begin() as conn:
+        row = (await conn.execute(text("SELECT id FROM users WHERE chat_id=:c"), {"c": chat_id})).fetchone()
+        if row:
+            return row[0]
+        new_id = (await conn.execute(text(
+            "INSERT INTO users(chat_id) VALUES(:c) RETURNING id"), {"c": chat_id}
+        )).scalar_one()
+        return new_id
+
+# ---------- Команды бота ----------
+@dp.message(Command("start"))
+async def cmd_start(m: Message):
+    user_id = await get_or_create_user(m.chat.id)
+    text = (
+        "Привет! Я Aquaballance 🐠\n\n"
+        "Команды:\n"
+        "/aq_add <имя> <литры> [описание] — добавить аквариум\n"
+        "/aq_list — список аквариумов\n"
+        "/aq_set <id> — сделать аквариум дефолтным\n"
+        "/test_add <aq_id|default> <ph> <kh> <gh> <no2> <no3> <tan> <po4> <tempC> — добавить замер\n"
+        "/help — помощь\n"
+    )
+    await m.answer(text)
+
+@dp.message(Command("aq_add"))
+async def cmd_aq_add(m: Message):
+    # формат: /aq_add <имя> <литры> [описание...]
+    args = (m.text or "").split(maxsplit=3)
+    if len(args) < 3:
+        await m.answer("Использование: /aq_add <имя> <литры> [описание]")
+        return
+    name = args[1]
+    try:
+        volume = int(args[2])
+    except:
+        await m.answer("Литраж должен быть целым числом.")
+        return
+    description = args[3] if len(args) == 4 else None
+    user_id = await get_or_create_user(m.chat.id)
+    async with engine.begin() as conn:
+        aq_id = (await conn.execute(text(
+            "INSERT INTO aquariums(user_id,name,description,volume_l) VALUES(:u,:n,:d,:v) RETURNING id"
+        ), {"u": user_id, "n": name, "d": description, "v": volume})).scalar_one()
+        # если нет дефолтного — назначим
+        await conn.execute(text("""
+            INSERT INTO user_settings(user_id, default_aquarium_id)
+            VALUES(:u, :a)
+            ON CONFLICT (user_id) DO NOTHING
+        """), {"u": user_id, "a": aq_id})
+    await m.answer(f"Аквариум добавлен: [{aq_id}] {name} — {volume} л" + (f"\nОписание: {description}" if description else ""))
+
+@dp.message(Command("aq_list"))
+async def cmd_aq_list(m: Message):
+    user_id = await get_or_create_user(m.chat.id)
+    async with engine.begin() as conn:
+        def_row = (await conn.execute(text("SELECT default_aquarium_id FROM user_settings WHERE user_id=:u"), {"u": user_id})).fetchone()
+        default_id = def_row[0] if def_row else None
+        rows = (await conn.execute(text("""
+            SELECT id, name, volume_l, COALESCE(description,'')
+            FROM aquariums WHERE user_id=:u ORDER BY id
+        """), {"u": user_id})).fetchall()
+    if not rows:
+        await m.answer("Аквариумов пока нет. Добавьте: /aq_add Имя 30 [описание]")
+        return
+    lines = []
+    for r in rows:
+        star = "⭐ " if default_id == r[0] else ""
+        lines.append(f"{star}[{r[0]}] {r[1]} — {r[2]} л — {r[3]}")
+    await m.answer("Ваши аквариумы:\n" + "\n".join(lines))
+
+@dp.message(Command("aq_set"))
+async def cmd_aq_set(m: Message):
+    args = (m.text or "").split(maxsplit=1)
+    if len(args) < 2:
+        await m.answer("Использование: /aq_set <id>")
+        return
+    try:
+        aq_id = int(args[1])
+    except:
+        await m.answer("id должен быть числом.")
+        return
+    user_id = await get_or_create_user(m.chat.id)
+    async with engine.begin() as conn:
+        # проверим, что аквариум принадлежит пользователю
+        ok = (await conn.execute(text("SELECT 1 FROM aquariums WHERE id=:a AND user_id=:u"), {"a": aq_id, "u": user_id})).fetchone()
+        if not ok:
+            await m.answer("Такого аквариума нет у вас.")
+            return
+        await conn.execute(text("""
+            INSERT INTO user_settings(user_id, default_aquarium_id)
+            VALUES(:u,:a)
+            ON CONFLICT (user_id)
+            DO UPDATE SET default_aquarium_id = EXCLUDED.default_aquarium_id
+        """), {"u": user_id, "a": aq_id})
+    await m.answer(f"Дефолтный аквариум установлен: {aq_id}")
+
+@dp.message(Command("test_add"))
+async def cmd_test_add(m: Message):
+    # /test_add <aq_id|default> ph kh gh no2 no3 tan po4 tempC
+    parts = (m.text or "").split()
+    if len(parts) < 10:
+        await m.answer("Использование: /test_add <aq_id|default> ph kh gh no2 no3 tan po4 tempC")
+        return
+    user_id = await get_or_create_user(m.chat.id)
+
+    async with engine.begin() as conn:
+        if parts[1].lower() == "default":
+            row = (await conn.execute(text("SELECT default_aquarium_id FROM user_settings WHERE user_id=:u"), {"u": user_id})).fetchone()
+            if not row or not row[0]:
+                await m.answer("Сначала установите дефолтный аквариум: /aq_set <id>")
+                return
+            aq_id = int(row[0])
+        else:
+            aq_id = int(parts[1])
+
+        vals = list(map(float, parts[2:10]))
+        ph, kh, gh, no2, no3, tan, po4, temp_c = vals
+        frac = unionized_fraction(ph, temp_c)
+        nh3 = tan * frac
+
+        await conn.execute(text("""
+            INSERT INTO water_tests(aquarium_id, measured_at, ph, kh, gh, no2, no3, tan, po4, temp_c, frac_nh3, nh3_mgL)
+            VALUES(:aq, :t, :ph, :kh, :gh, :no2, :no3, :tan, :po4, :temp, :frac, :nh3)
+        """), {
+            "aq": aq_id, "t": datetime.datetime.utcnow(),
+            "ph": ph, "kh": kh, "gh": gh, "no2": no2, "no3": no3,
+            "tan": tan, "po4": po4, "temp": temp_c, "frac": frac, "nh3": nh3
+        })
+
+    msg = f"Тест сохранён. Доля NH₃ (unionized) = {frac:.4f}. NH₃ = {nh3:.4f} mg/L."
+    if nh3 > 0.05:
+        msg += "\n⚠️ Внимание: NH₃ > 0.05 mg/L — возможна токсичность, рекомендована срочная подмена и аэрация."
+    await m.answer(msg)
+
+# ---- FastAPI endpoints ----
+@app.get("/health")
+async def health(request: Request, token: Optional[str] = None):
+    if token != KEEPALIVE_TOKEN:
+        raise HTTPException(status_code=403, detail="forbidden")
     return {"ok": True}
 
+@app.on_event("startup")
+async def on_startup():
+    await ensure_schema()
+    # стартуем polling в фоне
+    app.state.poller = asyncio.create_task(dp.start_polling(bot))
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    poller: asyncio.Task = app.state.poller
+    poller.cancel()
+    try:
+        await poller
+    except:
+        pass
+    await bot.session.close()
