@@ -1,8 +1,21 @@
-# Aquaballance_bot
+# AquaBalance Bot
 
-Телеграм-бот для ведения параметров аквариума.
+Telegram-бот для ведения параметров аквариумов, учета рыб и растений, а также анализа качества воды.
 
-## Запуск локально
-```bash
-pip install -r requirements.txt
-BOT_TOKEN=8256704407:AAGCZqEd_Pk-1x9_B-Y3YcZB_W4qUhSm2pU DATABASE_URL=postgresql://quaballance:JXTFLaJMzCOVzqGuMAKAfS9J3vCvjr84@dpg-d2dmg3mr433s73esoec0-a/bd_aquaballance?sslmode=require python main.py
+## Возможности
+- Добавление нескольких аквариумов с именем и описанием.
+- Хранение химических параметров воды (pH, KH, GH, NO₂, NO₃, NH₃/NH₄, PO₄).
+- Расчет концентрации NH₃/NH₄.
+- Просмотр списка аквариумов пользователя.
+- Работа в режиме Long Polling (без вебхуков).
+
+## Стек технологий
+- Python 3.13
+- aiogram — Telegram Bot API
+- psycopg2 — подключение к PostgreSQL
+- Render — хостинг бота
+- PostgreSQL — база данных
+
+## Переменные окружения
+Перед запуском создайте `.env` файл (локально) или задайте переменные в Render:
+
