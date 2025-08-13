@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS users (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Аквариумы (по пользователю: несколько штук)
+-- Аквариумы
 CREATE TABLE IF NOT EXISTS aquariums (
   id SERIAL PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -16,7 +16,7 @@ CREATE TABLE IF NOT EXISTS aquariums (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Параметры воды (история замеров)
+-- Параметры воды
 CREATE TABLE IF NOT EXISTS water_params (
   id SERIAL PRIMARY KEY,
   aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
@@ -25,15 +25,15 @@ CREATE TABLE IF NOT EXISTS water_params (
   gh NUMERIC(4,2),
   no2 NUMERIC(6,3),
   no3 NUMERIC(6,3),
-  tan NUMERIC(6,3),   -- Total Ammonia (NH3+NH4), мг/л
+  tan NUMERIC(6,3),   -- Total Ammonia (NH3+NH4)
   po4 NUMERIC(6,3),
   temp_c NUMERIC(5,2),
-  frac_nh3 NUMERIC(6,5), -- доля NH3 (unionized)
-  nh3_mgl NUMERIC(6,3),  -- NH3 mg/L (unionized)
+  frac_nh3 NUMERIC(6,5), -- доля NH3
+  nh3_mgl NUMERIC(6,3),  -- NH3 mg/L
   tested_at TIMESTAMPTZ DEFAULT now()
 );
 
--- Рыбы и растения (состав аквариума)
+-- Рыбы
 CREATE TABLE IF NOT EXISTS fishes (
   id SERIAL PRIMARY KEY,
   aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS fishes (
   created_at TIMESTAMPTZ DEFAULT now()
 );
 
+-- Растения
 CREATE TABLE IF NOT EXISTS plants (
   id SERIAL PRIMARY KEY,
   aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
@@ -49,7 +50,3 @@ CREATE TABLE IF NOT EXISTS plants (
   quantity INTEGER NOT NULL DEFAULT 1,
   created_at TIMESTAMPTZ DEFAULT now()
 );
-
--- Ускорим выборки
-CREATE INDEX IF NOT EXISTS idx_aquariums_user ON aquariums(user_id);
-CREATE INDEX IF NOT EXISTS idx_water_params_aq_time ON water_params(aquarium_id, tested_at DESC);
