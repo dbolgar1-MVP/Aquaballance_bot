@@ -1,6 +1,5 @@
-fastapi
-uvicorn
-gunicorn
-aiogram==3.*
-python-dotenv
-psycopg2-binary
+aiogram==3.0.0b7
+asyncpg==0.27.0
+python-dotenv==1.0.0
+matplotlib==3.8.1
+pandas==2.1.2
