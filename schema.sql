@@ -1,52 +1,56 @@
--- Пользователи
+-- Schema for Aquaballance_bot (MVP)
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
 CREATE TABLE IF NOT EXISTS users (
-  id SERIAL PRIMARY KEY,
-  telegram_id BIGINT UNIQUE NOT NULL,
+  id BIGINT PRIMARY KEY,
   username TEXT,
-  created_at TIMESTAMPTZ DEFAULT now()
+  first_name TEXT,
+  last_name TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
 
--- Аквариумы
 CREATE TABLE IF NOT EXISTS aquariums (
   id SERIAL PRIMARY KEY,
-  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id BIGINT NOT NULL,
   name TEXT NOT NULL,
   description TEXT,
-  volume_liters NUMERIC(6,2),
-  created_at TIMESTAMPTZ DEFAULT now()
+  volume_l REAL,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
 
--- Параметры воды
-CREATE TABLE IF NOT EXISTS water_params (
+CREATE TABLE IF NOT EXISTS water_tests (
   id SERIAL PRIMARY KEY,
-  aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
-  ph NUMERIC(4,2),
-  kh NUMERIC(4,2),
-  gh NUMERIC(4,2),
-  no2 NUMERIC(6,3),
-  no3 NUMERIC(6,3),
-  tan NUMERIC(6,3),   -- Total Ammonia (NH3+NH4)
-  po4 NUMERIC(6,3),
-  temp_c NUMERIC(5,2),
-  frac_nh3 NUMERIC(6,5), -- доля NH3
-  nh3_mgl NUMERIC(6,3),  -- NH3 mg/L
-  tested_at TIMESTAMPTZ DEFAULT now()
+  aquarium_id INT REFERENCES aquariums(id) ON DELETE CASCADE,
+  measured_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  ph REAL,
+  kh REAL,
+  gh REAL,
+  no2 REAL,
+  no3 REAL,
+  total_ammonia_mg_l REAL,
+  nh3_calculated_mg_l REAL,
+  nh3_fraction REAL,
+  po4 REAL,
+  temp_c REAL,
+  notes TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
 
--- Рыбы
-CREATE TABLE IF NOT EXISTS fishes (
+CREATE TABLE IF NOT EXISTS species (
   id SERIAL PRIMARY KEY,
-  aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  quantity INTEGER NOT NULL DEFAULT 1,
-  created_at TIMESTAMPTZ DEFAULT now()
+  name TEXT,
+  type TEXT, -- fish/plant
+  ph_min REAL, ph_max REAL,
+  gh_min REAL, gh_max REAL,
+  temp_min REAL, temp_max REAL,
+  notes TEXT
 );
 
--- Растения
-CREATE TABLE IF NOT EXISTS plants (
+CREATE TABLE IF NOT EXISTS aquarium_inhabitants (
   id SERIAL PRIMARY KEY,
-  aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
-  name TEXT NOT NULL,
-  quantity INTEGER NOT NULL DEFAULT 1,
-  created_at TIMESTAMPTZ DEFAULT now()
+  aquarium_id INT REFERENCES aquariums(id) ON DELETE CASCADE,
+  species_id INT REFERENCES species(id) ON DELETE SET NULL,
+  common_name TEXT,
+  quantity INT DEFAULT 1,
+  added_at TIMESTAMP WITH TIME ZONE DEFAULT now()
 );
