@@ -1,3 +1,5 @@
+gunicorn
+uvicorn[standard]
 aiogram==3.0.7
 fastapi==0.110.0
 uvicorn==0.29.0
