@@ -1,56 +1,57 @@
--- Schema for Aquaballance_bot (MVP)
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-
+-- Создание пользователей, аквариумов, обитателей, измерений, настроек подмен
 CREATE TABLE IF NOT EXISTS users (
-  id BIGINT PRIMARY KEY,
-  username TEXT,
-  first_name TEXT,
-  last_name TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    user_id BIGINT PRIMARY KEY,
+    username TEXT,
+    first_seen TIMESTAMPTZ DEFAULT now(),
+    active_aquarium_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS aquariums (
-  id SERIAL PRIMARY KEY,
-  user_id BIGINT NOT NULL,
-  name TEXT NOT NULL,
-  description TEXT,
-  volume_l REAL,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    volume_l NUMERIC(10,2),
+    description TEXT,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_aquariums_user ON aquariums(user_id);
+
+CREATE TABLE IF NOT EXISTS aquarium_fish (
+    id SERIAL PRIMARY KEY,
+    aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
+    species TEXT NOT NULL,
+    qty INTEGER NOT NULL CHECK (qty > 0),
+    added_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS water_tests (
-  id SERIAL PRIMARY KEY,
-  aquarium_id INT REFERENCES aquariums(id) ON DELETE CASCADE,
-  measured_at TIMESTAMP WITH TIME ZONE NOT NULL,
-  ph REAL,
-  kh REAL,
-  gh REAL,
-  no2 REAL,
-  no3 REAL,
-  total_ammonia_mg_l REAL,
-  nh3_calculated_mg_l REAL,
-  nh3_fraction REAL,
-  po4 REAL,
-  temp_c REAL,
-  notes TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+CREATE TABLE IF NOT EXISTS aquarium_plants (
+    id SERIAL PRIMARY KEY,
+    aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
+    species TEXT NOT NULL,
+    qty INTEGER NOT NULL CHECK (qty > 0),
+    added_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS species (
-  id SERIAL PRIMARY KEY,
-  name TEXT,
-  type TEXT, -- fish/plant
-  ph_min REAL, ph_max REAL,
-  gh_min REAL, gh_max REAL,
-  temp_min REAL, temp_max REAL,
-  notes TEXT
+CREATE TABLE IF NOT EXISTS water_settings (
+    aquarium_id INTEGER PRIMARY KEY REFERENCES aquariums(id) ON DELETE CASCADE,
+    change_volume_pct NUMERIC(5,2),
+    period_days INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS aquarium_inhabitants (
-  id SERIAL PRIMARY KEY,
-  aquarium_id INT REFERENCES aquariums(id) ON DELETE CASCADE,
-  species_id INT REFERENCES species(id) ON DELETE SET NULL,
-  common_name TEXT,
-  quantity INT DEFAULT 1,
-  added_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+CREATE TABLE IF NOT EXISTS measurements (
+    id SERIAL PRIMARY KEY,
+    aquarium_id INTEGER NOT NULL REFERENCES aquariums(id) ON DELETE CASCADE,
+    measured_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ph NUMERIC(4,2),
+    kh NUMERIC(5,2),
+    gh NUMERIC(5,2),
+    no2 NUMERIC(6,3),
+    no3 NUMERIC(6,2),
+    tan NUMERIC(6,3),
+    nh3 NUMERIC(6,3),
+    nh4 NUMERIC(6,3),
+    po4 NUMERIC(6,2),
+    temperature_c NUMERIC(5,2),
+    notes TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_meas_aq_time ON measurements(aquarium_id, measured_at DESC);
